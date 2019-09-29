@@ -35,6 +35,7 @@ from jiant.modules.sentence_encoder import SentenceEncoder
 from jiant.modules.bilm_encoder import BiLMEncoder
 from jiant.modules.bow_sentence_encoder import BoWSentEncoder
 from jiant.modules.elmo_character_encoder import ElmoCharacterEncoder
+from jiant.modules.moe import MoE
 from jiant.modules.onlstm_phrase_layer import ONLSTMPhraseLayer
 from jiant.modules.prpn_phrase_layer import PRPNPhraseLayer
 from jiant.modules.onlstm.ON_LSTM import ONLSTMStack
@@ -73,7 +74,7 @@ from jiant.utils.utils import (
 )
 
 # Elmo stuff
-# Look in $ELMO_SRC_DIR (e.g. /usr/share/jsalt/elmo) or download from web
+# Look in $ELMO_SRC_DIR (e.g. /usr/share/jsalt/elmo) or download from webf
 ELMO_OPT_NAME = "elmo_2x4096_512_2048cnn_2xhighway_options.json"
 ELMO_WEIGHTS_NAME = "elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
 ELMO_SRC_DIR = (
@@ -285,8 +286,10 @@ def build_model(args, vocab, pretrained_embs, tasks):
     d_task_input = d_sent_output + (args.skip_embs * d_emb)
 
     # Build model and classifiers
-    model = MultiTaskModel(args, sent_encoder, vocab)
-    build_task_modules(args, tasks, model, d_task_input, d_emb, embedder, vocab)
+    # has the forward method that redirects
+    #
+    model = MultiTaskModel(args, sent_encoder, vocab, d_task_input, d_emb, tasks)
+    build_task_modules(args, tasks, model, d_task_input, d_emb, embedder, vocab)  # set attr
     model = model.cuda() if args.cuda >= 0 else model
     log.info("Model specification:")
     log.info(model)
@@ -791,13 +794,14 @@ class MultiTaskModel(nn.Module):
     to the model.
     """
 
-    def __init__(self, args, sent_encoder, vocab):
+    def __init__(self, args, sent_encoder, vocab, d_task_input, d_emb, tasks):
         """ Args: sentence encoder """
         super(MultiTaskModel, self).__init__()
         self.sent_encoder = sent_encoder
         self.vocab = vocab
         self.utilization = Average() if args.track_batch_utilization else None
         self.elmo = args.input_module == "elmo"
+
         self.uses_pair_embedding = input_module_uses_pair_embedding(args.input_module)
         self.uses_mirrored_pair = input_module_uses_mirrored_pair(args.input_module)
         self.project_before_pooling = not (
@@ -805,6 +809,13 @@ class MultiTaskModel(nn.Module):
             and args.transfer_paradigm == "finetune"
         )  # Rough heuristic. TODO: Make this directly user-controllable.
         self.sep_embs_for_skip = args.sep_embs_for_skip
+
+        # TODO: A new flag
+        # TODO: assert moe can only with BERT etc.self.uses_pair_embedding
+        self.moe = None
+        if args.moe:
+            # the count includes target tasks. Right thing to do?
+            self.moe = MoE(input_dim=d_task_input, d_hid=d_emb, tasks=tasks)
 
     def forward(self, task, batch, predict=False):
         """
@@ -938,6 +949,8 @@ class MultiTaskModel(nn.Module):
 
     def _span_forward(self, batch, task, predict):
         sent_embs, sent_mask = self.sent_encoder(batch["input1"], task)
+        if self.moe:
+            sent_embs = self.moe.forward(sent_embs, task)
         module = getattr(self, "%s_mdl" % task.name)
         out = module.forward(batch, sent_embs, sent_mask, task, predict)
         return out
@@ -955,6 +968,8 @@ class MultiTaskModel(nn.Module):
             logits = classifier(sent, mask) + classifier(sent_m, mask_m)
         elif self.uses_pair_embedding:
             sent, mask = self.sent_encoder(batch["inputs"], task)
+            if self.moe:
+                sent = self.moe.forward(sent, task)
             # special case for WiC b/c we want to add representations of particular tokens
             if isinstance(task, WiCTask):
                 logits = classifier(sent, mask, [batch["idx1"], batch["idx2"]])
@@ -1123,6 +1138,8 @@ class MultiTaskModel(nn.Module):
         if self.uses_pair_embedding:
             for choice_idx in range(task.n_choices):
                 sent, mask = self.sent_encoder(batch["choice%d" % choice_idx], task)
+                if self.moe:
+                    sent = self.moe.forward(sent, task)
                 logit = module(sent, mask)
                 logits.append(logit)
         else:
@@ -1194,6 +1211,8 @@ class MultiTaskModel(nn.Module):
             # if using BERT/XLNet, we concatenate the passage, question, and answer
             inp = batch["psg_qst_ans"]
             ex_embs, ex_mask = self.sent_encoder(inp, task)
+            if self.moe:
+                ex_embs = self.moe.forward(ex_embs, task)
             logits = classifier(ex_embs, ex_mask)
             out["n_exs"] = get_batch_size(batch, keyword="psg_qst_ans")
         else:
@@ -1274,7 +1293,7 @@ def input_module_uses_pair_embedding(input_module):
 def input_module_uses_mirrored_pair(input_module):
     """
     This function tells whether the input model uses raw pair and mirrored pair simutaneously when
-    running on symmetrical pair tasks, like what GPT do on STS-B 
+    running on symmetrical pair tasks, like what GPT do on STS-B
     """
     return (
         input_module.startswith("openai-gpt")
